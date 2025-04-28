@@ -20,6 +20,8 @@ from aiogram.types.input_file import BufferedInputFile
 from db import Database
 import logging
 import sys
+from datetime import datetime
+from aiogram.utils.markdown import html_decoration as hd 
 
 logging.basicConfig(level=logging.INFO)
 
@@ -28,6 +30,7 @@ if sys.platform.startswith("win"):
 
 API_TOKEN = '7626300396:AAHxkGqY2GnarCEoxVlm9IfS-MCAfvG6fSM'
 ADMIN_USERNAME = '@lprost'
+ORDER_CHANNEL = -1002310332672
 
 logging.basicConfig(level=logging.INFO)
 
@@ -868,16 +871,21 @@ async def clear_cart(message: types.Message):
 async def checkout(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     if user_id not in user_carts or not user_carts[user_id]:
-        await message.answer("🛒 Ваша корзина пуста. Добавьте товары перед оформлением заказа.", reply_markup=get_main_menu_keyboard())
+        await message.answer(
+            "🛒 Ваша корзина пуста. Добавьте товары перед оформлением заказа.",
+            reply_markup=get_main_menu_keyboard()
+        )
         return
-    await message.answer("📞 Введите ваш номер телефона для связи:", reply_markup=get_main_menu_keyboard())
+    await message.answer(
+        "📞 Введите ваш номер телефона для связи:",
+        reply_markup=get_main_menu_keyboard()
+    )
     await state.set_state(OrderStates.waiting_for_contact)
 
-# Обработчик ввода телефона
+# Обработчик телефона
 @dp.message(OrderStates.waiting_for_contact)
 async def process_contact(message: types.Message, state: FSMContext):
     contact = message.text.strip()
-    # Простейшая валидация телефона (можно улучшить)
     if len(contact) < 5:
         await message.answer("❌ Введите корректный номер телефона:")
         return
@@ -885,80 +893,156 @@ async def process_contact(message: types.Message, state: FSMContext):
     await message.answer("📍 Введите адрес доставки:")
     await state.set_state(OrderStates.waiting_for_address)
 
-# Обработчик ввода адреса
+# Основной обработчик заказа
 @dp.message(OrderStates.waiting_for_address)
 async def process_address(message: types.Message, state: FSMContext):
+    # Получаем данные
     address = message.text.strip()
     data = await state.get_data()
     contact = data.get("contact", "Не указан")
     user_id = message.from_user.id
+    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
 
+    
+    # Проверяем корзину
     cart_items = user_carts.get(user_id, {})
     if not cart_items:
         await message.answer("🛒 Ваша корзина пуста.", reply_markup=get_main_menu_keyboard())
         await state.clear()
         return
-
+    
+    # Формируем данные заказа
     total_sum = sum(item['price'] * item['quantity'] for item in cart_items.values())
+    order_data = {
+        'user_id': user_id,
+        'username': message.from_user.username or "Без username",
+        'contact': contact,
+        'address': address,
+        'total_sum': total_sum,
+        'items': list(cart_items.values()),
+        'order_time': current_time
+    }
+    
+    # Генерируем Excel-файл
+    excel_file = await generate_excel(order_data)
+    
+    # Отправляем клиенту
+    await send_client_confirmation(message, order_data, excel_file)
+    
+    # Отправляем уведомления
+    await notify_order(order_data, excel_file)
+    
+    # Очищаем данные
+    user_carts[user_id].clear()
+    await state.clear()
 
-    # Отправляем краткое сообщение без списка товаров
-    order_summary = (
-        f"✅ *Заказ оформлен!*\n\n"
-        f"📞 *Контакт:* {contact}\n"
-        f"🏠 *Адрес:* {address}\n\n"
-        f"💰 *Итого:* {total_sum:.2f} ₽\n\n"
-        "📄 Подробности заказа в прикреплённом файле."
-    )
-    await message.answer(order_summary, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
-
-    # Формируем Excel-файл с заказом
+# Генерация Excel-файла
+async def generate_excel(order_data: dict) -> bytes:
     data = []
-    for product_id, product_info in cart_items.items():
+    for item in order_data['items']:
         data.append({
-            "Название": product_info['name'],
-            "Количество": product_info['quantity'],
-            "Цена за шт.": product_info['price'],
-            "Сумма": product_info['price'] * product_info['quantity']
+            "Название": item['name'],
+            "Количество": item['quantity'],
+            "Цена за шт.": item['price'],
+            "Сумма": item['price'] * item['quantity']
         })
+    
     df = pd.DataFrame(data)
     total_row = pd.DataFrame([{
         "Название": "Итого",
         "Количество": "",
         "Цена за шт.": "",
-        "Сумма": total_sum
+        "Сумма": order_data['total_sum']
     }])
     df = pd.concat([df, total_row], ignore_index=True)
-
+    
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, sheet_name='Заказ', index=False)
         writer.close()
     output.seek(0)
+    return output.read()
 
-    # Отправляем файл с заказом
+# Отправка клиенту
+async def send_client_confirmation(message: types.Message, order_data: dict, excel_file: bytes):
+    order_summary = (
+        "✅ <b>Заказ оформлен!</b>\n\n"
+        f"📞 <b>Контакт:</b> {hd.quote(order_data['contact'])}\n"
+        f"🏠 <b>Адрес:</b> {hd.quote(order_data['address'])}\n\n"
+        f"💰 <b>Итого:</b> {order_data['total_sum']:.2f} ₽\n\n"
+        "📄 Подробности заказа в прикреплённом файле."
+    )
+    
+    await message.answer(
+        order_summary,
+        parse_mode="HTML",
+        reply_markup=get_main_menu_keyboard()
+    )
+    
     await bot.send_document(
         chat_id=message.chat.id,
-        document=types.BufferedInputFile(output.read(), filename="Заказ.xlsx")
+        document=types.BufferedInputFile(excel_file, filename="Заказ.xlsx")
     )
-
-    # Отправляем кнопку для связи с менеджером
-    manager_username = "lprost"  # замени на нужный username
+    
+    # Кнопка связи с менеджером
     contact_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="📩 Связаться с менеджером",
-                url=f"https://t.me/{manager_username}"
-            )
-        ]
+        [InlineKeyboardButton(
+            text="📩 Связаться с менеджером",
+            url=f"https://t.me/{ADMIN_USERNAME}"
+        )]
     ])
+    
     await message.answer(
         "📢 Чтобы завершить оформление заказа, напишите менеджеру.",
         reply_markup=contact_keyboard
     )
 
-    # Очищаем корзину и состояние
-    user_carts[user_id].clear()
-    await state.clear()
+# Отправка уведомлений
+async def notify_order(order_data: dict, excel_file: bytes):
+    # Текст для админов/канала
+    text = (
+        "🚨 <b>Новый заказ!</b>\n\n"
+        f"👤 <b>Клиент:</b> {order_data['user_id']}\n"
+        f"📞 <b>Контакт:</b> <code>{hd.quote(order_data['contact'])}</code>\n"
+        f"🏠 <b>Адрес:</b> {hd.quote(order_data['address'])}\n\n"
+        f"💰 <b>Сумма:</b> {order_data['total_sum']:.2f} ₽\n"
+        f"🕒 <b>Время:</b> {hd.quote(order_data['order_time'])}"
+    )
+    
+    # Отправка админам
+    for admin_id in admin_ids:
+        try:
+           await bot.send_document(
+            chat_id=admin_id,
+            document=types.BufferedInputFile(
+                excel_file,
+                filename=f"Заказ_{order_data['user_id']}.xlsx"
+            ),
+            caption=text,  
+            parse_mode="HTML"
+        )
+        except Exception as e:
+            logging.error(f"Ошибка отправки админу {admin_id}: {e}")
+    
+    # Отправка в канал
+    if ORDER_CHANNEL:
+        try:
+            await bot.send_document(
+            chat_id=ORDER_CHANNEL,
+            document=types.BufferedInputFile(
+                excel_file,
+                filename=f"Заказ_{order_data['user_id']}.xlsx"
+            ),
+            caption=text,  # Текст теперь в подписи к файлу
+            parse_mode="HTML"
+        )
+        except Exception as e:
+            logging.error(f"Ошибка отправки в канал: {e}")
+        # Дополнительно уведомляем админа об ошибке
+            await bot.send_message(
+            admin_ids[0],
+            f"⚠️ Ошибка отправки в канал: {str(e)[:300]}"
+        )
 
 
 
