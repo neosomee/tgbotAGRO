@@ -22,8 +22,13 @@ import logging
 import sys
 from datetime import datetime
 from aiogram.utils.markdown import html_decoration as hd 
+import unicodedata
+import aiohttp
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+)
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -38,7 +43,7 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-MAX_ROWS_PER_FILE = 1000
+MAX_ROWS_PER_FILE = 50
 
 class OrderQuantity(StatesGroup):
     waiting_for_quantity = State()
@@ -51,7 +56,9 @@ class UploadStates(StatesGroup):
 
 class UserStates(StatesGroup):
     waiting_for_article_request = State()
+    article_requested_once = State()
     waiting_for_multiple_articles_file = State()
+    
 
 class MultipleArticlesStates(StatesGroup):
     waiting_for_file = State()
@@ -72,9 +79,12 @@ admin_ids = [5056594883, 6521061663]
 
 categories = []
 products = []
+products_by_id = {}
+categories_dict = {}
 
 user_carts = {}
 
+BASE_URL = "https://xn--80aaijtwglegf.xn--p1ai/"
 
 
 def remove_keyboard():
@@ -133,6 +143,23 @@ def get_cart_keyboard():
     return keyboard
 
 
+async def shorten_url(long_url: str) -> str:
+    if not long_url:
+        return ''
+    api_url = f"http://tinyurl.com/api-create.php?url={long_url}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url) as resp:
+                if resp.status == 200:
+                    short_url = await resp.text()
+                    if short_url.startswith('http'):
+                        return short_url
+    except Exception as e:
+        logging.warning(f"Ошибка сокращения ссылки {long_url}: {e}")
+    # Если не удалось сократить - возвращаем оригинал
+    return long_url
+
+
 def split_message(text, max_length=4096):
     parts = []
     while len(text) > max_length:
@@ -144,31 +171,92 @@ def split_message(text, max_length=4096):
     parts.append(text)
     return parts
 
-import re
+
+SIMILAR_CHARS_MAP = {
+    'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H',
+    'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'У': 'Y', 'Х': 'X',
+    'а': 'A', 'в': 'B', 'е': 'E', 'к': 'K', 'м': 'M', 'н': 'H',
+    'о': 'O', 'р': 'P', 'с': 'C', 'т': 'T', 'у': 'Y', 'х': 'X',
+}
 
 def normalize_article(article) -> str:
-    """Нормализация артикула: удаление спецсимволов и приведение к верхнему регистру"""
+    """
+    Универсальная нормализация артикула:
+    - Приведение к строке
+    - Unicode нормализация
+    - Приведение к верхнему регистру
+    - Замена похожих русских букв на латинские
+    - Удаление всех символов кроме латинских букв и цифр
+    """
     if not article:
         return ''
-    
-    article = str(article).strip().upper()
-    
-    # Удаление всех специальных символов (можно расширять список)
-    for char in (' ', '-', '.', '/', '\\', '_', ':', ','):
-        article = article.replace(char, '')
-    
+    article = str(article)
+    article = unicodedata.normalize('NFKC', article)
+    article = article.upper()
+    article = ''.join(SIMILAR_CHARS_MAP.get(ch, ch) for ch in article)
+    article = re.sub(r'[^A-Z0-9]', '', article)
     return article
 
+def get_product_image_url(product: dict) -> str | None:
+    img = product.get('_IMAGE_') or ''
+    if img:
+        img = img.strip()
+        if img.startswith('http'):
+            return img
+        else:
+            return urljoin(BASE_URL, img)
+    # Попытка взять из _IMAGES_ или _PRODUCT_IMAGES_
+    for field in ['_IMAGES_', '_PRODUCT_IMAGES_']:
+        imgs = product.get(field)
+        if imgs:
+            first_img = imgs.split(';')[0].strip()
+            if first_img:
+                if first_img.startswith('http'):
+                    return first_img
+                else:
+                    return urljoin(BASE_URL, first_img)
+    return None
+
+async def get_image_url_from_product_page(url: str) -> str | None:
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        # Пример селектора, адаптируй под свой сайт
+        img_tag = soup.select_one('.product-image img') or soup.select_one('.product-page img')
+        if img_tag and img_tag.get('src'):
+            img_url = img_tag['src']
+            if not img_url.startswith('http'):
+                img_url = urljoin(url, img_url)
+            return img_url
+    except Exception as e:
+        logging.warning(f"Ошибка при парсинге фото с сайта {url}: {e}")
+    return None
+
 def find_product_by_article(article_query: str, products: list, use_cache=True):
-    """Поиск товара с возможностью кэширования"""
     norm_query = normalize_article(article_query)
-    
     if use_cache:
         if not hasattr(find_product_by_article, '_cache'):
-            find_product_by_article._cache = {normalize_article(p['_SKU_']): p for p in products}
+            find_product_by_article._cache = {}
+            for p in products:
+                norm_sku = normalize_article(p.get('_SKU_', ''))
+                norm_name = normalize_article(p.get('_NAME_', ''))
+                # Кэшируем по обоим ключам
+                find_product_by_article._cache[norm_sku] = p
+                find_product_by_article._cache[norm_name] = p
         return find_product_by_article._cache.get(norm_query)
-    
-    return next((p for p in products if normalize_article(p['_SKU_']) == norm_query), None)
+    else:
+        return next(
+            (p for p in products if normalize_article(p.get('_SKU_', '')) == norm_query or normalize_article(p.get('_NAME_', '')) == norm_query),
+            None
+        )
+
+
+
+def clear_find_product_cache():
+    """Очистить кэш поиска, если данные товаров обновились."""
+    if hasattr(find_product_by_article, '_cache'):
+        del find_product_by_article._cache
 
 def parse_price(price_str):
     try:
@@ -180,60 +268,41 @@ def parse_price(price_str):
 def normalize_sku(sku: str):
     return str(sku).replace('.', '').strip()
 
-def format_product_info(product):
-    return (
-        f"🛠️ *Название:* {product.get('_NAME_', 'Нет названия')}\n"
-        f"🔖 *Артикул:* {product.get('_SKU_', 'Нет артикула')}\n"
-        f"💰 *Цена:* {product.get('_PRICE_', 'Нет цены')} ₽\n"
-        f"📦 *В наличии:* {product.get('_QUANTITY_', '0')} шт."
+def format_product_info(product, sku=None) -> str:
+    """
+    Форматирует информацию о товаре для отправки пользователю.
+    Если sku не передан, берёт из product['_SKU_'].
+    """
+    if sku is None:
+        sku = product.get('_SKU_', '')
+    # Защита от nan (если sku - float nan)
+    if isinstance(sku, float) and str(sku).lower() == 'nan':
+        sku = ''
+
+    name = product.get('_NAME_', 'Без названия')
+    price = product.get('_PRICE_', 'Цена не указана')
+    quantity = product.get('_QUANTITY_', 0)
+    stock_status = product.get('_STOCK_STATUS_', 'Нет данных')
+
+    # Форматируем цену с рублём, если это число
+    try:
+        price_str = f"{float(price):.2f} ₽"
+    except (ValueError, TypeError):
+        price_str = str(price)
+
+    text = (
+        f"🛠️ *Название:* {name}\n"
+        f"🔖 *Артикул:* {sku}\n"
+        f"💰 *Цена:* {price_str}\n"
+        f"📦 *В наличии:* {quantity} шт.\n"
     )
+    return text
+
 
 async def send_message_in_parts(message: types.Message, text: str, **kwargs):
     for part in split_message(text):
         await message.answer(part, **kwargs)
 
-async def show_cart(message: types.Message):
-    user_id = message.from_user.id
-    await message.answer("⏳ Формирую файл с вашей корзиной...", reply_markup=get_back_to_main_menu_keyboard())
-
-    if user_id not in user_carts or not user_carts[user_id]:
-        await message.answer("🛒 Корзина пуста", reply_markup=get_back_to_main_menu_keyboard())
-        return
-
-    rows = []
-    total_sum = 0.0
-
-    for product_id, item in user_carts[user_id].items():
-        sku = ''
-        product = next((p for p in products if str(p.get('_ID_')) == str(product_id)), None)
-        if product:
-            sku = product.get('_SKU_', '')
-        name = item['name']
-        quantity = item['quantity']
-        price = item['price']
-        sum_price = price * quantity
-        total_sum += sum_price
-        rows.append({
-            "Артикул": sku,
-            "Название": name,
-            "Количество": quantity,
-            "Цена за единицу (₽)": price,
-            "Сумма (₽)": sum_price
-        })
-
-    df = pd.DataFrame(rows)
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Корзина')
-
-    output.seek(0)
-
-    doc = BufferedInputFile(output.read(), filename="Корзина.xlsx")
-
-    await bot.send_document(chat_id=user_id, document=doc, caption=f"🛒 Ваша корзина. Итого: {total_sum:.2f} ₽")
-
-    await bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=get_cart_keyboard())
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -454,20 +523,38 @@ async def process_categories_file(message: types.Message, state: FSMContext):
         file_path = file.file_path
         file_content = await bot.download_file(file_path)
         raw_data = file_content.read()
+
+        # Определяем кодировку
         result = chardet.detect(raw_data)
         encoding = result['encoding'] or 'utf-8'
 
+        # Читаем CSV с разделителем ';'
         df = pd.read_csv(io.BytesIO(raw_data), sep=';', encoding=encoding, header=0)
+
+        # Убираем кавычки и пробелы из названий столбцов
         df.columns = df.columns.str.strip('"').str.strip()
 
-        global categories
+        logging.info(f"Колонки в CSV категорий: {df.columns.tolist()}")
+        logging.info(f"Первые 5 строк:\n{df.head()}")
+
         categories = df.to_dict('records')
 
-        await message.answer(f"✅ Загружено {len(categories)} категорий.", reply_markup=get_admin_keyboard())
+        global categories_dict
+        categories_dict = {
+            str(item['_ID_']): item['_NAME_']
+            for item in categories if '_ID_' in item and '_NAME_' in item
+        }
+
+        await message.answer(f"✅ Загружено {len(categories_dict)} категорий.", reply_markup=get_admin_keyboard())
         await state.clear()
+
     except Exception as e:
+        logging.exception("Ошибка при обработке файла категорий")
         await message.answer(f"❌ Ошибка при обработке файла категорий: {e}", reply_markup=get_admin_keyboard())
         await state.clear()
+
+
+
 
 @dp.message(UploadStates.waiting_for_products, F.document)
 async def process_products_file(message: types.Message, state: FSMContext):
@@ -483,109 +570,250 @@ async def process_products_file(message: types.Message, state: FSMContext):
         df = pd.read_csv(io.BytesIO(raw_data), sep=';', encoding=encoding, header=0)
         df.columns = df.columns.str.strip('"').str.strip()
 
-        global products
+        global products, products_by_sku, products_by_id
         products = df.to_dict('records')
+        products_by_sku = {normalize_sku(item.get('SKU_')): item for item in products if item.get('SKU_')}
+        products_by_id = {str(item.get('_ID_')): item for item in products if item.get('_ID_')}
 
-        await message.answer(f"✅ Загружено {len(products)} продуктов",reply_markup=get_admin_keyboard())
-        await state.set_state(None)
+        await message.answer(f"✅ Загружено {len(products)} продуктов", reply_markup=get_admin_keyboard())
+        await state.clear()
     except Exception as e:
+        logging.exception("Ошибка при обработке файла продуктов")
         await message.answer(f"❌ Ошибка при обработке файла продуктов: {e}", reply_markup=get_admin_keyboard())
         await state.clear()
+
 
 @dp.message(F.text == "🔍 Запрос одного артикула")
 async def start_single_article(message: types.Message, state: FSMContext):
     await message.answer("✏️ Введите артикул для поиска информации и фото товара:", reply_markup=get_back_to_main_menu_keyboard())
     await state.set_state(UserStates.waiting_for_article_request)
 
-class UserStates(StatesGroup):
-    waiting_for_article_request = State()
-    article_requested_once = State()  # новое состояние - после первого запроса
-
-@dp.message(UserStates.waiting_for_article_request)
-async def handle_article_request(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-
-    # Спецкоманды
-    if text == "🏠 Основное меню":
-        await state.clear()
-        await message.answer("Вы в основном меню.", reply_markup=get_main_menu_keyboard())
-        return
-
-    if text == "🛒 Перейти в корзину":
-        await handle_cart_button(message)
-        return
-
-    if text == "🗑 Очистить корзину":
-        user_id = message.from_user.id
-        if user_id in user_carts:
-            user_carts[user_id].clear()
-            await message.answer("🗑 Корзина очищена.", reply_markup=get_main_menu_keyboard())
-        else:
-            await message.answer("🗑 Корзина уже пуста.", reply_markup=get_main_menu_keyboard())
-        return
-    
-    if text == "✅ Оформить заказ":
-        # Передаем управление в хэндлер оформления заказа
-        await checkout(message, state)
-        return
-
-    # Дальше - поиск по артикулу
-    raw_query = text
-    norm_query = normalize_article(raw_query)
-    
-    product = next((p for p in products if normalize_article(p.get('_SKU_', '')) == norm_query), None)
-
-    if product:
-        # Отправка фото
-        product_url = product.get('_URL_')
-        photo_sent = False
+async def get_image_url_from_product_page(url: str) -> str | None:
+    try:
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        if product_url:
+        # Пример: ищем первый тег <img> с нужным классом или id
+        img_tag = soup.find('img', class_='product-image')  # адаптируй под свой сайт
+        if img_tag and img_tag.get('src'):
+            img_url = img_tag['src']
+            # Если ссылка относительная, дополни её
+            if not img_url.startswith('http'):
+                from urllib.parse import urljoin
+                img_url = urljoin(url, img_url)
+            return img_url
+    except Exception as e:
+        logging.warning(f"Ошибка при парсинге изображения с {url}: {e}")
+    return None
+
+async def get_image_url_from_product_page_async(url: str) -> str | None:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, get_image_url_from_product_page, url)  
+
+
+@dp.message(MultipleArticlesStates.waiting_for_file, F.document)
+async def process_multiple_articles_file(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer("⏳ Обрабатываю файл, добавляю товары в корзину...", reply_markup=get_back_to_main_menu_keyboard())
+
+    try:
+        file_id = message.document.file_id
+        file = await bot.get_file(file_id)
+        file_content = await bot.download_file(file.file_path)
+        raw_data = file_content.read()
+
+        df = pd.read_excel(io.BytesIO(raw_data), dtype=str)
+
+        if df.shape[1] < 3:
+            await message.answer("❗ В файле должно быть минимум 3 столбца: Артикул, Название, Количество.", reply_markup=get_back_to_main_menu_keyboard())
+            return
+
+        rows = []
+        total_sum = 0.0
+        total_added_quantity = 0
+
+        if user_id not in user_carts:
+            user_carts[user_id] = {}
+
+        for _, row in df.iterrows():
             try:
-                response = requests.get(product_url, timeout=10)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                img_tag = (soup.select_one('.product-image img') or 
-                          soup.select_one('.product-page img') or
-                          next((tag for tag in soup.find_all('img') 
-                              if norm_query in normalize_article(tag.get('src', ''))), None))
-                
-                if img_tag and img_tag.get('src'):
-                    img_url = img_tag['src']
-                    if not img_url.startswith('http'):
-                        img_url = urljoin(product_url, img_url)
-                    
-                    await message.answer_photo(
-                        photo=img_url,
-                        caption=f"🖼 {product.get('_NAME_', '')}"
-                    )
-                    photo_sent = True
-            except Exception as e:
-                await message.answer("⚠️ Не удалось загрузить фото товара")
+                sku = normalize_sku(str(row.iloc[0]))
+                file_name = str(row.iloc[1]).strip() if not pd.isna(row.iloc[1]) else ''
+                quantity_str = str(row.iloc[2]).strip()
 
-        # Отправка информации о товаре
-        text = format_product_info(product)
-        quantity = int(product.get('_QUANTITY_', 0))
-        product_id = product.get('_ID_')
-        
-        await send_message_in_parts(
-            message,
-            text,
-            reply_markup=get_product_keyboard(product_id, quantity),
-            parse_mode='Markdown'
-        )
-        
-        # Предложение ввести следующий артикул
-        await message.answer(
-            "➡️ Введите следующий артикул или вернитесь в меню",
-            reply_markup=get_back_to_main_menu_keyboard()
-        )
-    else:
-        await message.answer(
-            f"❌ Товар '{raw_query}' не найден. Проверьте артикул",
-            reply_markup=get_cart_keyboard()
-        )
+                if not sku or not quantity_str.isdigit():
+                    continue
+
+                quantity = int(quantity_str)
+
+                product = next((p for p in products if normalize_sku(p.get('_SKU_', '')) == sku), None)
+                if product:
+                    product_id = str(product.get('_ID_'))
+                    price = parse_price(product.get('_PRICE_', '0'))
+                    available = int(product.get('_QUANTITY_', 0))
+                    name = file_name if file_name else product.get('_NAME_', 'Без названия')
+
+                    quantity_to_add = min(quantity, available)
+
+                    if product_id in user_carts[user_id]:
+                        user_carts[user_id][product_id]['quantity'] += quantity_to_add
+                    else:
+                        user_carts[user_id][product_id] = {
+                            'quantity': quantity_to_add,
+                            'price': price,
+                            'name': name
+                        }
+
+                    sum_price = price * quantity_to_add
+                    total_sum += sum_price
+                    total_added_quantity += quantity_to_add
+
+                    rows.append({
+                        "Артикул": sku,
+                        "Название": name,
+                        "Количество (запрошено)": quantity,
+                        "Количество (добавлено)": quantity_to_add,
+                        "Цена": price,
+                        "Доступно": available,
+                        "Сумма": sum_price,
+                        "Статус": "Добавлено"
+                    })
+                else:
+                    rows.append({
+                        "Артикул": sku,
+                        "Название": file_name,
+                        "Количество (запрошено)": quantity,
+                        "Количество (добавлено)": 0,
+                        "Цена": "Не найдено",
+                        "Доступно": "Не найдено",
+                        "Сумма": 0,
+                        "Статус": "Не найден"
+                    })
+
+            except Exception:
+                logging.exception("Ошибка при обработке строки")
+
+        if not rows:
+            await message.answer("⚠️ В файле не найдено ни одного артикула из базы.", reply_markup=get_back_to_main_menu_keyboard())
+            await state.clear()
+            return
+
+        # Формируем Excel с результатами обработки файла
+        df_result = pd.DataFrame(rows)
+        total_rows = len(df_result)
+        num_sheets = math.ceil(total_rows / MAX_ROWS_PER_FILE)
+        logging.info(f"Всего строк для результата: {total_rows}, листов будет: {num_sheets}")
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            for i in range(num_sheets):
+                start = i * MAX_ROWS_PER_FILE
+                end = min(start + MAX_ROWS_PER_FILE, total_rows)
+                part_df = df_result.iloc[start:end]
+                sheet_name = f'Результаты_{i+1}'
+                part_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                worksheet = writer.sheets[sheet_name]
+                worksheet.set_column('A:A', 20)
+                worksheet.set_column('B:B', 40)
+                worksheet.set_column('C:D', 18)
+                worksheet.set_column('E:G', 15)
+                worksheet.set_column('H:H', 15)
+
+        output.seek(0)
+        filename = "Результаты_поиска_в_нескольких_листах.xlsx"
+        doc = BufferedInputFile(output.read(), filename=filename)
+        await bot.send_document(chat_id=user_id, document=doc, caption=f"Результаты поиска ({num_sheets} листов)", reply_markup=get_back_to_main_menu_keyboard())
+
+        await message.answer(f"✅ Добавлено товаров в корзину: {total_added_quantity} на сумму {total_sum:.2f} ₽", reply_markup=get_back_to_main_menu_keyboard())
+        await show_cart(message)  # Показываем корзину сразу после загрузки файла
+        await state.clear()
+
+    except Exception as e:
+        logging.exception("Ошибка при обработке файла")
+        await message.answer(f"❌ Ошибка при обработке файла: {e}", reply_markup=get_back_to_main_menu_keyboard())
+        await state.clear()
+
+# Показ корзины с сокращением ссылок и формированием Excel
+@dp.message(F.text == "🛒 Корзина")
+async def show_cart(message: types.Message):
+    global categories_dict
+    user_id = message.from_user.id
+
+    if user_id not in user_carts or not user_carts[user_id]:
+        await message.answer("🛒 Ваша корзина пуста.", reply_markup=get_main_menu_keyboard())
+        return
+
+    await message.answer("⏳ Формирую файл с вашей корзиной…")
+
+    cart_items = list(user_carts[user_id].items())
+    product_ids = [str(pid) for pid, _ in cart_items]
+
+    # Асинхронно сокращаем ссылки
+    async def get_short_url(pid):
+        product = products_by_id.get(pid, {})
+        long_url = product.get('_URL_', '')
+        return await shorten_url(long_url)
+
+    short_urls = await asyncio.gather(*(get_short_url(pid) for pid in product_ids))
+
+    rows = []
+    for (product_id, product_info), short_url in zip(cart_items, short_urls):
+        pid_str = str(product_id)
+        product = products_by_id.get(pid_str, {})
+        url = product.get('_URL_', '')
+        link = short_url if short_url and short_url.startswith('http') else url
+
+        category_id = product.get('_PARENT_ID_') or product.get('_CATEGORY_ID_')
+        category_name = categories_dict.get(str(category_id), 'Без категории')
+
+        logging.info(f"[DEBUG] Товар {pid_str}: category_id={category_id}, category_name={category_name}")
+
+        rows.append({
+            "Артикул": pid_str,
+            "Название": product_info.get('name', ''),
+            "Категория": category_name,
+            "Ссылка": link,
+            "Количество": product_info.get('quantity', 0),
+            "Цена за шт.": product_info.get('price', 0),
+            "Сумма": product_info.get('price', 0) * product_info.get('quantity', 0)
+        })
+
+
+
+    df = pd.DataFrame(rows)
+    total_rows = len(df)
+    num_sheets = math.ceil(total_rows / MAX_ROWS_PER_FILE)
+    logging.info(f"Всего товаров: {total_rows}, листов: {num_sheets}")
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        for i in range(num_sheets):
+            start = i * MAX_ROWS_PER_FILE
+            end = min(start + MAX_ROWS_PER_FILE, total_rows)
+            part_df = df.iloc[start:end]
+            if part_df.empty:
+                logging.info(f"Лист {i+1} пустой, пропускаем")
+                continue
+            sheet_name = f"Корзина_{i+1}"
+            part_df.to_excel(writer, index=False, sheet_name=sheet_name)
+            worksheet = writer.sheets[sheet_name]
+            worksheet.set_column('A:A', 20)  # Артикул
+            worksheet.set_column('B:B', 40)  # Название
+            worksheet.set_column('C:C', 25)  # Категория
+            worksheet.set_column('D:D', 50)  # Ссылка
+            worksheet.set_column('E:E', 15)  # Количество
+            worksheet.set_column('F:F', 15)  # Цена за шт.
+            worksheet.set_column('G:G', 15)  # Сумма
+
+    output.seek(0)
+    file_name = "Корзина_вся_частями.xlsx"
+    file = BufferedInputFile(output.read(), filename=file_name)
+
+    await bot.send_document(chat_id=user_id, document=file, caption="Ваша корзина (несколько листов)")
+
+    total_sum = sum(row["Сумма"] for row in rows)
+    await message.answer(f"🛒 Итого: {total_sum:.2f} ₽", reply_markup=get_cart_keyboard())
 
   
 @dp.callback_query(F.data.startswith("add_"))
@@ -688,6 +916,7 @@ async def handle_cart_button(message: types.Message):
         reply_markup=get_main_menu_keyboard()  # Или другая клавиатура для корзины
     )
 
+
 @dp.message(F.text == "📊 Просчёт Excel с артикулами")
 async def start_multiple_articles(message: types.Message, state: FSMContext):
     await message.answer(
@@ -697,7 +926,6 @@ async def start_multiple_articles(message: types.Message, state: FSMContext):
     )
     await state.set_state(MultipleArticlesStates.waiting_for_file)
 
-MAX_ROWS_PER_FILE = 1000
 
 @dp.message(MultipleArticlesStates.waiting_for_file, F.document)
 async def process_multiple_articles_file(message: types.Message, state: FSMContext):
@@ -707,8 +935,7 @@ async def process_multiple_articles_file(message: types.Message, state: FSMConte
     try:
         file_id = message.document.file_id
         file = await bot.get_file(file_id)
-        file_path = file.file_path
-        file_content = await bot.download_file(file_path)
+        file_content = await bot.download_file(file.file_path)
         raw_data = file_content.read()
 
         df = pd.read_excel(io.BytesIO(raw_data), dtype=str)
@@ -724,11 +951,11 @@ async def process_multiple_articles_file(message: types.Message, state: FSMConte
         if user_id not in user_carts:
             user_carts[user_id] = {}
 
-        for index, row in df.iterrows():
+        for _, row in df.iterrows():
             try:
-                sku = normalize_sku(str(row[0]))
-                file_name = str(row[1]).strip() if not pd.isna(row[1]) else ''
-                quantity_str = str(row[2]).strip()
+                sku = normalize_sku(str(row.iloc[0]))
+                file_name = str(row.iloc[1]).strip() if not pd.isna(row.iloc[1]) else ''
+                quantity_str = str(row.iloc[2]).strip()
 
                 if not sku or not quantity_str.isdigit():
                     continue
@@ -737,7 +964,7 @@ async def process_multiple_articles_file(message: types.Message, state: FSMConte
 
                 product = next((p for p in products if normalize_sku(p.get('_SKU_', '')) == sku), None)
                 if product:
-                    product_id = product.get('_ID_')
+                    product_id = str(product.get('_ID_'))
                     price = parse_price(product.get('_PRICE_', '0'))
                     available = int(product.get('_QUANTITY_', 0))
                     name = file_name if file_name else product.get('_NAME_', 'Без названия')
@@ -779,7 +1006,7 @@ async def process_multiple_articles_file(message: types.Message, state: FSMConte
                         "Статус": "Не найден"
                     })
 
-            except Exception as e:
+            except Exception:
                 logging.exception("Ошибка при обработке строки")
 
         if not rows:
@@ -787,28 +1014,31 @@ async def process_multiple_articles_file(message: types.Message, state: FSMConte
             await state.clear()
             return
 
+        # Формируем Excel с результатами
         df_result = pd.DataFrame(rows)
-        num_files = math.ceil(len(df_result) / MAX_ROWS_PER_FILE)
+        total_rows = len(df_result)
+        num_sheets = math.ceil(total_rows / MAX_ROWS_PER_FILE)
+        logging.info(f"Всего строк для результата: {total_rows}, листов будет: {num_sheets}")
 
-        for i in range(num_files):
-            start = i * MAX_ROWS_PER_FILE
-            end = min((i + 1) * MAX_ROWS_PER_FILE, len(df_result))
-            part_df = df_result.iloc[start:end]
-
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                part_df.to_excel(writer, index=False, sheet_name='Результаты')
-                worksheet = writer.sheets['Результаты']
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            for i in range(num_sheets):
+                start = i * MAX_ROWS_PER_FILE
+                end = min(start + MAX_ROWS_PER_FILE, total_rows)
+                part_df = df_result.iloc[start:end]
+                sheet_name = f'Результаты_{i+1}'
+                part_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                worksheet = writer.sheets[sheet_name]
                 worksheet.set_column('A:A', 20)
                 worksheet.set_column('B:B', 40)
                 worksheet.set_column('C:D', 18)
                 worksheet.set_column('E:G', 15)
                 worksheet.set_column('H:H', 15)
 
-            output.seek(0)
-            filename = f"Результаты_поиска_часть_{i+1}.xlsx"
-            doc = BufferedInputFile(output.read(), filename=filename)
-            await bot.send_document(chat_id=user_id, document=doc, caption=f"Результаты поиска (часть {i+1}/{num_files})", reply_markup=get_back_to_main_menu_keyboard())
+        output.seek(0)
+        filename = "Результаты_поиска_в_нескольких_листах.xlsx"
+        doc = BufferedInputFile(output.read(), filename=filename)
+        await bot.send_document(chat_id=user_id, document=doc, caption=f"Результаты поиска ({num_sheets} листов)", reply_markup=get_back_to_main_menu_keyboard())
 
         await message.answer(f"✅ Добавлено товаров в корзину: {total_added_quantity} на сумму {total_sum:.2f} ₽", reply_markup=get_back_to_main_menu_keyboard())
         await show_cart(message)  # сразу показываем корзину
@@ -819,44 +1049,86 @@ async def process_multiple_articles_file(message: types.Message, state: FSMConte
         await message.answer(f"❌ Ошибка при обработке файла: {e}", reply_markup=get_back_to_main_menu_keyboard())
         await state.clear()
 
+
 @dp.message(F.text == "🛒 Корзина")
 async def show_cart(message: types.Message):
     user_id = message.from_user.id
-    if user_id in user_carts and user_carts[user_id]:
-        cart_items = user_carts[user_id]
 
-        await message.answer("⏳ Формирую файл с вашей корзиной…")
-
-        data = []
-        total_sum = 0.0
-        for product_id, product_info in cart_items.items():
-            row = {
-                "Артикул": product_id,
-                "Название": product_info['name'],
-                "Количество": product_info['quantity'],
-                "Цена за шт.": product_info['price'],
-                "Сумма": product_info['price'] * product_info['quantity']
-            }
-            total_sum += row["Сумма"]
-            data.append(row)
-
-        df = pd.DataFrame(data)
-
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, sheet_name='Корзина', index=False)
-            writer.close()
-        output.seek(0)
-
-        await bot.send_document(
-            chat_id=message.chat.id,
-            document=types.BufferedInputFile(output.read(), filename="Корзина.xlsx"),
-            caption="Ваша корзина в файле"
-        )
-
-        await message.answer(f"🛒 Итого: {total_sum:.2f} ₽", reply_markup=get_cart_keyboard())
-    else:
+    if user_id not in user_carts or not user_carts[user_id]:
         await message.answer("🛒 Ваша корзина пуста.", reply_markup=get_main_menu_keyboard())
+        return
+
+    await message.answer("⏳ Формирую файл с вашей корзиной…")
+
+    cart_items = list(user_carts[user_id].items())
+    product_ids = [str(pid) for pid, _ in cart_items]
+
+    # Асинхронно сокращаем ссылки
+    async def get_short_url(pid):
+        product = products_by_id.get(pid, {})
+        long_url = product.get('_URL_', '')
+        return await shorten_url(long_url)
+
+    short_urls = await asyncio.gather(*(get_short_url(pid) for pid in product_ids))
+
+    rows = []
+    for (product_id, product_info), short_url in zip(cart_items, short_urls):
+        pid_str = str(product_id)
+        product = products_by_id.get(pid_str, {})  # Получаем товар из базы
+        category = categories_dict.get(pid_str, 'Без категории')
+        price = product_info.get('price', 0)
+        quantity = product_info.get('quantity', 0)
+        name = product_info.get('name', '')
+
+        logging.info(f"Товар {pid_str} оригинальная ссылка: {product.get('_URL_', '')}, сокращённая ссылка: {short_url}")
+
+        # Далее формируем строку для таблицы
+        rows.append({
+            "Артикул": pid_str,
+            "Название": name,
+            "Категория": category,
+            "Ссылка": short_url if short_url.startswith('http') else product.get('_URL_', ''),
+            "Количество": quantity,
+            "Цена за шт.": price,
+            "Сумма": price * quantity
+        })
+
+
+    df = pd.DataFrame(rows)
+    total_rows = len(df)
+    num_sheets = math.ceil(total_rows / MAX_ROWS_PER_FILE)
+    logging.info(f"Всего товаров: {total_rows}, листов: {num_sheets}")
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        for i in range(num_sheets):
+            start = i * MAX_ROWS_PER_FILE
+            end = min(start + MAX_ROWS_PER_FILE, total_rows)
+            part_df = df.iloc[start:end]
+            if part_df.empty:
+                logging.info(f"Лист {i+1} пустой, пропускаем")
+                continue
+            sheet_name = f"Корзина_{i+1}"
+            part_df.to_excel(writer, index=False, sheet_name=sheet_name)
+            worksheet = writer.sheets[sheet_name]
+            worksheet.set_column('A:A', 20)  # Артикул
+            worksheet.set_column('B:B', 40)  # Название
+            worksheet.set_column('C:C', 25)  # Категория
+            worksheet.set_column('D:D', 50)  # Ссылка
+            worksheet.set_column('E:E', 15)  # Количество
+            worksheet.set_column('F:F', 15)  # Цена за шт.
+            worksheet.set_column('G:G', 15)  # Сумма
+
+    output.seek(0)
+    file_name = "Корзина_вся_частями.xlsx"
+    file = BufferedInputFile(output.read(), filename=file_name)
+
+    await bot.send_document(chat_id=message.chat.id, document=file, caption="Ваша корзина (несколько листов)")
+
+    total_sum = sum(row["Сумма"] for row in rows)
+    await message.answer(f"🛒 Итого: {total_sum:.2f} ₽", reply_markup=get_cart_keyboard())
+
+
 
 # Обработчик кнопки "Очистить корзину"
 @dp.message(F.text == "🗑 Очистить корзину")
@@ -1002,7 +1274,7 @@ async def notify_order(order_data: dict, excel_file: bytes):
     # Текст для админов/канала
     text = (
         "🚨 <b>Новый заказ!</b>\n\n"
-        f"👤 <b>Клиент:</b> {order_data['user_id']}\n"
+        f"👤 <b>Клиент:</b> {order_data['username']}\n"
         f"📞 <b>Контакт:</b> <code>{hd.quote(order_data['contact'])}</code>\n"
         f"🏠 <b>Адрес:</b> {hd.quote(order_data['address'])}\n\n"
         f"💰 <b>Сумма:</b> {order_data['total_sum']:.2f} ₽\n"
